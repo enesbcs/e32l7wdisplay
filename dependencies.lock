@@ -1,0 +1,95 @@
+dependencies:
+  espressif/esp-lib-utils:
+    component_hash: 9e81fa27e3a8292bed95d91754ebcb8f27f47117328b0b646446f29fc5a847fb
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.2.3
+  espressif/esp32_display_panel:
+    component_hash: eebd62cf2d8678e4d07c5b44e42bb8043a9f7b53e5b9cf1dff8d3f27818fe22a
+    dependencies:
+    - name: idf
+      version: '>=5.1'
+    - name: espressif/esp-lib-utils
+      public: true
+      version: 0.2.*
+    - name: espressif/esp32_io_expander
+      public: true
+      version: 1.*
+    source:
+      git: https://github.com/esp-arduino-libs/ESP32_Display_Panel.git
+      path: .
+      type: git
+    version: 92b790ed6d24b0678e2f45b1fc85f0abd2d41b33
+  espressif/esp32_io_expander:
+    component_hash: c34d64ac6022fb351dc8e2a24eff5b60884c91fd8c50f96dd7d1b1728fae16d8
+    dependencies:
+    - name: espressif/esp-lib-utils
+      registry_url: https://components.espressif.com
+      require: public
+      version: 0.2.*
+    - name: idf
+      require: private
+      version: '>=5.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.1.1
+  espressif/esp_lvgl_port:
+    component_hash: d3c020b45c3dfc0d1706a83b63a1c34a6eb444a6e935f9afff79f92b7b94dcef
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.2'
+    - name: lvgl/lvgl
+      registry_url: https://components.espressif.com
+      require: public
+      version: '>=8,<10'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 2.9.0
+  espressif/esp_websocket_client:
+    component_hash: dc00233af846f3a744ada283a300e0d586040aadc3ee67361645ecdce4523672
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.8.0
+  idf:
+    source:
+      type: idf
+    version: 5.5.3
+  joltwallet/esp_littlefs:
+    component_hash: 7146f497e2af3621a4f958b30078c4c2d78bb065453222c6a2bf4b9ca9fb73a5
+    dependencies:
+    - name: idf
+      version: '>=5.0'
+    source:
+      git: https://github.com/joltwallet/esp_littlefs.git
+      path: .
+      type: git
+    version: bde79e13be971a1f06d5e5f55e6f3e8568fa32b5
+  lvgl/lvgl:
+    component_hash: 184e532558c1c45fefed631f3e235423d22582aafb4630f3e8885c35281a49ae
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 9.5.0
+direct_dependencies:
+- espressif/esp32_display_panel
+- espressif/esp_lvgl_port
+- espressif/esp_websocket_client
+- joltwallet/esp_littlefs
+- lvgl/lvgl
+manifest_hash: 22cc082668773b65494fa652a9e442328b7456219d6280e10ab25e819000f795
+target: esp32s3
+version: 2.0.0
