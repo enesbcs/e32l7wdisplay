@@ -750,8 +750,64 @@ void Dashboard::refresh(uint32_t nowMs) {
         return;
     }
     for (auto &cell : s_cells) {
+        // age ticker: ALWAYS runs, from the cell-local data timestamp, with
+        // no registry lock and no allocations (SSO strings only). The
+        // generation gate below skips values/names only - gating this too
+        // froze every row at "just now" (and never tripped stale styling).
+        {
+            std::string tstr;
+            bool stale = false;
+            if (cell.lastDataMs != 0) {
+                char buf[24];
+                // guard: an upsert stamped by another task AFTER main sampled
+                // now (same loop iteration) would wrap to ~1193h + red for one
+                // cycle; clamp like the /dashboard mirror already does
+                uint32_t age = (nowMs >= cell.lastDataMs) ? (nowMs - cell.lastDataMs) : 0;
+                if (age < 90 * 1000) {
+                    tstr = "just now";
+                } else if (age < 3600 * 1000) {
+                    snprintf(buf, sizeof(buf), "%u min ago", (unsigned)(age / 60000));
+                    tstr = buf;
+                } else {
+                    snprintf(buf, sizeof(buf), "%u h ago", (unsigned)(age / 3600000));
+                    tstr = buf;
+                }
+                stale = (age > 3600 * 1000);
+            }
+            if (tstr != cell.cacheTime) {
+                if (tstr.size() <= 64) { lv_label_set_text(cell.timeLabel, tstr.c_str());; }
+                cell.cacheTime = tstr;
+            }
+            // NOTE: lv_obj_set_style_* ALWAYS invalidates (even with identical
+            // values), so setting them every second forced a full-cell redraw +
+            // PSRAM framebuffer flush at 1 Hz - visible as a jump while the RGB
+            // DMA scanout contends with other PSRAM traffic. Set once at build
+            // (dark) and only on stale transitions from here.
+            if (stale != cell.cacheStale) {
+                cell.cacheStale = stale;
+                if (stale) {
+                    lv_obj_set_style_bg_color(cell.container, lv_color_make(200, 30, 30), 0);
+                    lv_obj_set_style_text_color(cell.nameLabel, lv_color_white(), 0);
+                } else {
+                    lv_obj_set_style_bg_color(cell.container, lv_color_make(18, 18, 18), 0);
+                    lv_obj_set_style_text_color(cell.nameLabel, lv_color_white(), 0);
+                }
+               ;
+            }
+        }
+        // generation short-circuit: unchanged rows cost one lock + one int
+        // compare (no strings, no second lookup). Missing rows (gen 0)
+        // always fall through to the existing empty-handling below.
+        uint32_t gen = SensorRegistry::getGeneration(cell.sensorId);
+        if (gen != 0 && gen == cell.lastGeneration) continue;
+        SensorSnapshot snap;
+        bool have = SensorRegistry::getSnapshot(cell.sensorId, snap) && snap.found;
+        // reset on miss: a reappearing entry restarts generation at 1, which
+        // could otherwise equal a stale cached value and stick forever
+        if (have) cell.lastGeneration = snap.reading.generation;
+        else cell.lastGeneration = 0;
         SensorReading r;
-        bool have = SensorRegistry::get(cell.sensorId, r);
+        if (have) r = snap.reading;
 
         // content guard: a corrupt std::string (wild length) would send the
         // text pipeline crawling gigabytes instead of failing fast
@@ -763,7 +819,7 @@ void Dashboard::refresh(uint32_t nowMs) {
             }
             return true;
         };
-        std::string name = have ? SensorRegistry::getDisplayName(cell.sensorId) : cell.sensorId;
+        std::string name = have ? snap.name : cell.sensorId;
         // hard cut: never let the name wrap onto the value rows
         if (cell.maxNameChars > 3 && name.size() > cell.maxNameChars) {
             size_t n = cell.maxNameChars - 1;
@@ -778,8 +834,7 @@ void Dashboard::refresh(uint32_t nowMs) {
         // entry existence (!= data): RSSI/name stubs have no T/H/B.
         // Time/stale/placeholders follow real data only (mirror parity).
         bool haveData = have && (r.hasTemperature || r.hasHumidity || r.hasBattery);
-        std::string temp, hum, batt, tstr;
-        uint32_t age = 0;
+        std::string temp, hum, batt;
         if (haveData) {
             char buf[24];
             if (r.hasTemperature) {
@@ -794,26 +849,16 @@ void Dashboard::refresh(uint32_t nowMs) {
                 snprintf(buf, sizeof(buf), "%d %%", (int)(r.battery + 0.5f));
                 batt = buf;
             }
-            // last updated
-            age = nowMs - r.lastUpdateMillis;
-            if (age < 90 * 1000) {
-                tstr = "just now";
-            } else if (age < 3600 * 1000) {
-                snprintf(buf, sizeof(buf), "%u min ago", (unsigned)(age / 60000));
-                tstr = buf;
-            } else {
-                snprintf(buf, sizeof(buf), "%u h ago", (unsigned)(age / 3600000));
-                tstr = buf;
-            }
+            // remember the data timestamp for the lock-free age ticker above
+            // (the ticker, not this gated path, owns the time label)
+            cell.lastDataMs = r.lastUpdateMillis;
         } else {
             // no data yet: keep rows empty (no placeholders)
             temp = "";
             hum = "";
             batt = "";
-            tstr = "";
+            cell.lastDataMs = 0;
         }
-
-        bool stale = haveData && (age > 3600 * 1000);
 
         if (temp != cell.cacheTemp) {
             if (sane(temp, "temp")) { lv_label_set_text(cell.tempLabel, temp.c_str());; }
@@ -840,10 +885,6 @@ void Dashboard::refresh(uint32_t nowMs) {
                ;
             }
         }
-        if (tstr != cell.cacheTime) {
-            if (sane(tstr, "time")) { lv_label_set_text(cell.timeLabel, tstr.c_str());; }
-            cell.cacheTime = tstr;
-        }
 
         // icons only for data the device actually reported
         auto showIf = [](lv_obj_t *o, bool show) {
@@ -866,23 +907,6 @@ void Dashboard::refresh(uint32_t nowMs) {
                 lv_label_set_text(cell.rssiLabel, rbuf);
                ;
             }
-        }
-
-        // NOTE: lv_obj_set_style_* ALWAYS invalidates (even with identical
-        // values), so setting them every second forced a full-cell redraw +
-        // PSRAM framebuffer flush at 1 Hz - visible as a jump while the RGB
-        // DMA scanout contends with other PSRAM traffic. Set once at build
-        // (dark) and only on stale transitions from here.
-        if (stale != cell.cacheStale) {
-            cell.cacheStale = stale;
-            if (stale) {
-                lv_obj_set_style_bg_color(cell.container, lv_color_make(200, 30, 30), 0);
-                lv_obj_set_style_text_color(cell.nameLabel, lv_color_white(), 0);
-            } else {
-                lv_obj_set_style_bg_color(cell.container, lv_color_make(18, 18, 18), 0);
-                lv_obj_set_style_text_color(cell.nameLabel, lv_color_white(), 0);
-            }
-           ;
         }
     }
     if (nowMs - lastAlive > 30000) {

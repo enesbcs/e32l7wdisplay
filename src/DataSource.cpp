@@ -17,7 +17,7 @@ void DataSource::stopAll() {
     BLEScan::end();
 }
 
-void DataSource::apply(AppConfig &config) {
+bool DataSource::apply(AppConfig &config) {
     if (s_activeSource != -1 && s_activeSource != config.data_source) {
         // genuine switch: pinned cells reference dead sensors from the old
         // source, drop them (and their name overrides) everywhere.
@@ -25,7 +25,9 @@ void DataSource::apply(AppConfig &config) {
         config.name_override_ids.clear();
         ConfigManager::save(config);
         SensorRegistry::pruneStale(0); // drop all stale registry entries
-        LogBuffer::logf("Data source switched: dashboard cells cleared");
+        LogBuffer::logf("Data source switched: rebooting into the new source");
+        s_activeSource = config.data_source;
+        return true; // caller reboots; no live re-apply (BLE never releases)
     }
     s_activeSource = config.data_source;
     stopAll();
@@ -49,6 +51,7 @@ void DataSource::apply(AppConfig &config) {
             LogBuffer::logf("Unknown data source %d", config.data_source);
             break;
     }
+    return false; // live re-applied, no reboot needed
 }
 
 bool DataSource::anySourceConnected(bool) {

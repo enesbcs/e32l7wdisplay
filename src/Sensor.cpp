@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <new>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <utility>
 
@@ -64,19 +65,29 @@ void SensorRegistry::upsert(const PsramString &id, bool hasT, float t, bool hasH
     }
     if (!takeSensor()) return;
     auto &entry = (*s_sensors)[id];
+    bool changed = false;
     if (hasT) {
+        if (!entry.reading.hasTemperature || entry.reading.temperature != t) changed = true;
         entry.reading.hasTemperature = true;
         entry.reading.temperature = t;
     }
     if (hasH) {
+        if (!entry.reading.hasHumidity || entry.reading.humidity != h) changed = true;
         entry.reading.hasHumidity = true;
         entry.reading.humidity = h;
     }
     if (hasB) {
+        if (!entry.reading.hasBattery || entry.reading.battery != b) changed = true;
         entry.reading.hasBattery = true;
         entry.reading.battery = b;
     }
-    if (hasT || hasH || hasB) {
+    // generation AND data timestamp bump only on real change: HA emits
+    // state_changed events for attribute-only updates too (same value
+    // string), and re-stamping those kept every cell at "just now" forever
+    // (same-source repeats are bit-identical, so == is exact here; NaN was
+    // sanitized above). Staleness follows T/H/B data, like RSSI already does.
+    if (changed) {
+        entry.reading.generation++;
         entry.reading.lastUpdateMillis = (uint32_t)(esp_timer_get_time() / 1000);
     }
     xSemaphoreGive(s_mutex);
@@ -103,26 +114,60 @@ void SensorRegistry::getAllCells(std::vector<std::string> &ids) {
     xSemaphoreGive(s_mutex);
 }
 
+// caller must hold the sensor lock
+static void resolveNameLocked(const SensorEntry &entry, const PsramString &id,
+                              std::string &name) {
+    if (!entry.nameOverride.empty()) name.assign(entry.nameOverride.c_str());
+    else if (!entry.autoName.empty()) name.assign(entry.autoName.c_str());
+    else if (!entry.manufacturer.empty())
+        name = std::string(entry.manufacturer.c_str()) + " " + id.c_str();
+}
+
 std::string SensorRegistry::getDisplayName(const PsramString &id) {
     if (!s_sensors) return std::string(id.c_str());
     std::string name;
     if (!takeSensor()) return std::string(id.c_str());
     auto it = s_sensors->find(id);
-    if (it != s_sensors->end()) {
-        if (!it->second.nameOverride.empty()) name.assign(it->second.nameOverride.c_str());
-        else if (!it->second.autoName.empty()) name.assign(it->second.autoName.c_str());
-        else if (!it->second.manufacturer.empty())
-            name = std::string(it->second.manufacturer.c_str()) + " " + id.c_str();
-    }
+    if (it != s_sensors->end()) resolveNameLocked(it->second, id, name);
     xSemaphoreGive(s_mutex);
     return name.empty() ? std::string(id.c_str()) : name;
+}
+
+uint32_t SensorRegistry::getGeneration(const PsramString &id) {
+    if (!s_sensors) return 0;
+    uint32_t gen = 0;
+    if (!takeSensor()) return 0;
+    auto it = s_sensors->find(id);
+    if (it != s_sensors->end()) gen = it->second.reading.generation;
+    xSemaphoreGive(s_mutex);
+    return gen;
+}
+
+bool SensorRegistry::getSnapshot(const PsramString &id, SensorSnapshot &out) {
+    out = SensorSnapshot();
+    if (!s_sensors) return false;
+    if (!takeSensor()) return false;
+    auto it = s_sensors->find(id);
+    if (it == s_sensors->end()) {
+        xSemaphoreGive(s_mutex);
+        return false;
+    }
+    out.found = true;
+    out.reading = it->second.reading;
+    resolveNameLocked(it->second, id, out.name);
+    if (out.name.empty()) out.name.assign(id.c_str());
+    xSemaphoreGive(s_mutex);
+    return true;
 }
 
 void SensorRegistry::setManufacturer(const PsramString &id, const PsramString &mfg) {
     if (!s_sensors || mfg.empty()) return;
     if (!takeSensor()) return;
     auto it = s_sensors->find(id);
-    if (it != s_sensors->end()) it->second.manufacturer = mfg;
+    if (it != s_sensors->end()) {
+        it->second.manufacturer = mfg;
+        it->second.reading.generation++;
+    }
     xSemaphoreGive(s_mutex);
 }
 
@@ -130,18 +175,32 @@ void SensorRegistry::setRssi(const PsramString &id, int dbm) {
     if (!s_sensors) return;
     if (!takeSensor()) return;
     auto it = s_sensors->find(id);
-    if (it != s_sensors->end()) {
-        // data timestamp untouched: staleness follows T/H/B data, not RSSI
-        it->second.reading.hasRssi = true;
-        it->second.reading.rssiDbm = dbm;
+    if (it == s_sensors->end()) {
+        xSemaphoreGive(s_mutex);
+        return;
     }
+    auto &rd = it->second.reading;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    // throttle: min 5s interval and min 3dB delta (first write always passes);
+    // data timestamp untouched: staleness follows T/H/B data, not RSSI
+    if (rd.hasRssi && abs(dbm - rd.rssiDbm) < 3 && now - rd.lastRssiMs < 5000) {
+        xSemaphoreGive(s_mutex);
+        return;
+    }
+    bool changed = !rd.hasRssi || rd.rssiDbm != dbm;
+    rd.hasRssi = true;
+    rd.rssiDbm = dbm;
+    rd.lastRssiMs = now;
+    if (changed) rd.generation++;
     xSemaphoreGive(s_mutex);
 }
 
 void SensorRegistry::setDisplayName(const PsramString &id, const PsramString &name) {
     if (!s_sensors) return;
     if (!takeSensor()) return;
-    (*s_sensors)[id].nameOverride = name;
+    auto &entry = (*s_sensors)[id];
+    entry.nameOverride = name;
+    entry.reading.generation++; // names repaint through the generation gate
     xSemaphoreGive(s_mutex);
 }
 
@@ -150,7 +209,10 @@ void SensorRegistry::setAutoName(const PsramString &id, const PsramString &name,
     if (!s_sensors || name.empty()) return;
     if (!takeSensor()) return;
     auto &entry = (*s_sensors)[id];
-    if (!onlyIfEmpty || entry.autoName.empty()) entry.autoName = name;
+    if (!onlyIfEmpty || entry.autoName.empty()) {
+        entry.autoName = name;
+        entry.reading.generation++;
+    }
     xSemaphoreGive(s_mutex);
 }
 
@@ -186,7 +248,10 @@ void SensorRegistry::removeDisplayName(const PsramString &id) {
     if (!s_sensors) return;
     if (!takeSensor()) return;
     auto it = s_sensors->find(id);
-    if (it != s_sensors->end()) it->second.nameOverride.clear();
+    if (it != s_sensors->end()) {
+        it->second.nameOverride.clear();
+        it->second.reading.generation++;
+    }
     xSemaphoreGive(s_mutex);
 }
 

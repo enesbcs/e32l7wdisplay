@@ -190,8 +190,8 @@
     #define LV_THEME_DEFAULT_GROW 1
     #define LV_THEME_DEFAULT_TRANSITION_TIME 80
 #endif
-#define LV_USE_THEME_SIMPLE 1
-#define LV_USE_THEME_MONO 1
+#define LV_USE_THEME_SIMPLE 0
+#define LV_USE_THEME_MONO 0
 
 #define LV_USE_FLEX 1
 #define LV_USE_GRID 1
@@ -217,7 +217,9 @@
 #define LV_USE_QRCODE 0
 #define LV_USE_BARCODE 0
 #define LV_USE_FREETYPE 0
-#define LV_USE_TINY_TTF 1
+// No runtime .ttf on the device (static lv_font_conv bitmaps only);
+// TinyTTF (stb_truetype) stays out: flash + one assert-class saved.
+#define LV_USE_TINY_TTF 0
 #define LV_USE_RLOTTIE 0
 #define LV_USE_VECTOR_GRAPHIC  0
 #define LV_USE_THORVG_INTERNAL 0

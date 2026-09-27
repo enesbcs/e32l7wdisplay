@@ -36,9 +36,20 @@ using namespace esp_panel::board;
 static AppConfig s_appConfig;
 static bool s_wifiOk = false;
 static bool s_apMode = false;
-// staged boot: STA-up anchor + phase (0 = armed, 1 = source done, 2 = done)
+// staged boot: STA-up anchor + phase (0 = armed, 1 = source done, 2 = done).
+// The delays are boot-storm mitigation, not functional waits: the blocking
+// WiFi connect (with DHCP) is already done when the anchor is set, but the
+// BLE-controller init (source) and the MQTT task+timers (integration) must
+// not collide with each other or with the STA-up transients (that collision
+// was the esp_timer ISR boot-loop). Keep the ORDER and the SEPARATION;
+// the absolute numbers may shrink, the gaps may not vanish.
+// Timings: source at +1s, integration +2s after the source apply returns
+// (previously fixed +3s/+8s wall clock).
 static uint32_t s_stageBaseMs = 0;
+static uint32_t s_stage1Ms = 0;
 static int s_stage = 0;
+static constexpr uint32_t STAGE_SOURCE_MS = 1000;
+static constexpr uint32_t STAGE_INTEGRATION_GAP_MS = 2000;
 
 void updateLiveConfig(const AppConfig &cfg) {
     s_appConfig = cfg;
@@ -129,9 +140,10 @@ static void wifiReconnectTask(void *arg) {
             Dashboard::applyConfig(s_appConfig);
             WebServer::onConfigChanged();
             LogBuffer::logf("WiFi reconnected");
-            // integration trailed by 5s (and was missing here entirely:
-            // without this it stayed silent until reboot/save)
-            vTaskDelay(pdMS_TO_TICKS(5000));
+            // integration trailed by 2s (and was missing here entirely:
+            // without this it stayed silent until reboot/save). The gap (not
+            // the absolute time) keeps the MQTT burst off the source burst.
+            vTaskDelay(pdMS_TO_TICKS(2000));
             Integration::apply(s_appConfig);
         } else {
             backoffMs = backoffMs >= 300000 ? 300000 : backoffMs * 2;
@@ -284,9 +296,10 @@ extern "C" void app_main() {
 
     WebServer::start();
 
-    // heavy starts are staged from the 1Hz loop below (T+3s source,
-    // T+8s integration) so BLE-controller/MQTT heap+timer bursts do not
-    // collide seconds after STA-up (boot-storm crash mitigation)
+    // heavy starts are staged from the 1Hz loop below (source at +1s,
+    // integration +2s after the source apply) so BLE-controller/MQTT
+    // heap+timer bursts do not collide seconds after STA-up (boot-storm
+    // crash mitigation)
     if (!s_apMode) {
         s_stageBaseMs = (uint32_t)(esp_timer_get_time() / 1000);
         s_stage = 0;
@@ -367,11 +380,13 @@ extern "C" void app_main() {
             HAWebSocket::tick(now);
             Integration::tick(now);
             if (!s_apMode && s_stageBaseMs != 0 && s_stage < 2) {
-                if (s_stage == 0 && now - s_stageBaseMs >= 3000) {
+                if (s_stage == 0 && now - s_stageBaseMs >= STAGE_SOURCE_MS) {
                     s_stage = 1;
                     DataSource::apply(s_appConfig);
                     Dashboard::applyConfig(s_appConfig);
-                } else if (s_stage == 1 && now - s_stageBaseMs >= 8000) {
+                    s_stage1Ms = (uint32_t)(esp_timer_get_time() / 1000);
+                } else if (s_stage == 1 && s_stage1Ms != 0
+                           && now - s_stage1Ms >= STAGE_INTEGRATION_GAP_MS) {
                     s_stage = 2;
                     Integration::apply(s_appConfig);
                 }

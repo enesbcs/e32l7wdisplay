@@ -53,6 +53,8 @@ private:
         size_t maxNameChars = 0;
         std::string cacheName, cacheTemp, cacheHum, cacheBatt, cacheTime;
         int cacheRssiDbm = -1000; // redraw text only on >=2 dB change (churn)
+        uint32_t lastGeneration = 0; // skip rows whose reading is unchanged
+        uint32_t lastDataMs = 0; // data timestamp for the lock-free age ticker
         bool cacheStale = false;
         int cacheBattLvl = -1;
     };

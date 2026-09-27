@@ -91,6 +91,199 @@ static void statesTimerStart() {
         esp_timer_start_once(s_statesTimer, 8000000);
 }
 
+// ---- streaming entity-registry parse ---------------------------------
+// The registry answer (500KB and growing) is parsed element-by-element
+// straight off the 1KB transport chunks: only sensor.* + device_id pairs
+// are kept, everything else is discarded on the fly. Steady state stays
+// under ~32KB PSRAM for ANY registry size (the 1MB accumulate-then-DOM
+// path would drop the frame instead). Small messages keep the legacy path.
+enum StreamPhase { SS_OFF, SS_SEEK_ARRAY, SS_IN_ARRAY };
+static bool s_streamActive = false; // this inbound frame = registry result
+static bool s_streamDead = false;   // pathological frame: drop silently
+static StreamPhase s_ssPhase = StreamPhase::SS_OFF;
+static PsramString s_tail;          // incomplete element bytes across chunks
+static size_t s_scanned = 0;        // tail bytes already scanned (each byte is
+                                    // scanned EXACTLY once: rescanning old bytes
+                                    // with the new entry string-state inverts the
+                                    // quote phase and silently drops elements)
+static int s_arrDepth = 0;
+static bool s_inStr = false;
+static bool s_esc = false;
+static int s_elStart = -1;          // tail-relative '{' of open element (-1 none)
+static int s_elDepth = 0;           // brace depth of open element
+static int s_regKept = 0;
+static int s_regShown = 0;
+
+static void streamReset() {
+    s_streamActive = false;
+    s_streamDead = false;
+    s_ssPhase = StreamPhase::SS_OFF;
+    s_tail.clear();
+    s_scanned = 0;
+    s_arrDepth = 0;
+    s_inStr = false;
+    s_esc = false;
+    s_elStart = -1;
+    s_elDepth = 0;
+    s_regKept = 0;
+    s_regShown = 0;
+}
+
+// raw integer value of "key" within the head bytes (envelope peek)
+static bool rawIntVal(const char *data, int len, const char *key, int &out) {
+    char pat[32];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    size_t plen = strlen(pat);
+    int n = len < 128 ? len : 128;
+    for (int i = 0; i + (int)plen + 2 < n; i++) {
+        if (memcmp(data + i, pat, plen) != 0) continue;
+        int j = i + (int)plen;
+        while (j < n && (data[j] == ' ' || data[j] == '\t')) j++;
+        if (j >= n || data[j] != ':') continue;
+        j++;
+        while (j < n && (data[j] == ' ' || data[j] == '\t')) j++;
+        if (j >= n) return false;
+        bool neg = false;
+        if (data[j] == '-') { neg = true; j++; }
+        if (j >= n || data[j] < '0' || data[j] > '9') continue;
+        int v = 0;
+        while (j < n && data[j] >= '0' && data[j] <= '9')
+            v = v * 10 + (data[j++] - '0');
+        out = neg ? -v : v;
+        return true;
+    }
+    return false;
+}
+
+static void processRegistryElement(const char *data, int len) {
+    cJSON *el = cJSON_ParseWithLength(data, len);
+    if (!el) return;
+    const cJSON *eid = cJSON_GetObjectItem(el, "entity_id");
+    const cJSON *did = cJSON_GetObjectItem(el, "device_id");
+    if (!cJSON_IsString(eid) || !eid->valuestring
+        || strncmp(eid->valuestring, "sensor.", 7) != 0) {
+        cJSON_Delete(el);
+        return;
+    }
+    s_regKept++; // same counting as the legacy DOM path (all sensor.*)
+    if (cJSON_IsString(did) && did->valuestring && did->valuestring[0]) {
+        (*s_entities)[eid->valuestring] = did->valuestring;
+        if (s_regShown < 3) {
+            LogBuffer::logfSerial("HA WS: e.g. %s", eid->valuestring);
+            s_regShown++;
+        }
+    }
+    cJSON_Delete(el);
+}
+
+static void finishRegistryStream() {
+    LogBuffer::logfSerial("HA WS: registry: %d sensor entities", s_regKept);
+    streamReset();
+    s_registryDone = true;
+    statesTimerStop();
+    requestStates();
+}
+
+// feed one registry chunk; complete top-level {...} elements are parsed
+// immediately, the incomplete tail stays buffered (bounded below).
+// INVARIANT: every tail byte is scanned EXACTLY once, in order, with live
+// element/string state (s_scanned/s_elStart/s_elDepth persist across calls).
+// Re-scanning already-scanned bytes with the new entry string-state inverts
+// the quote phase whenever a chunk ends mid-string and silently drops
+// elements (fuzz seeds 101..106: last element lost, stalls, cascades).
+static void streamRegistryChunk(const char *data, int len) {
+    if (len <= 0 || !data) return;
+    if (s_tail.size() + (size_t)len > (size_t)(64 * 1024)) {
+        LogBuffer::logfSerial("HA WS: registry stream overrun, dropping frame");
+        s_streamDead = true;
+        return;
+    }
+    s_tail.append(data, len);
+    const char *buf = s_tail.c_str();
+    size_t blen = s_tail.size();
+    size_t consumed = 0;
+    if (s_ssPhase == StreamPhase::SS_SEEK_ARRAY) {
+        // envelope: ..."result":[  (the "type":"result" value never matches:
+        // a comma/brace follows it, never a colon+bracket)
+        bool found = false;
+        // 7-byte overlap: a split "\"result\"" (8B) refinds on the next chunk.
+        // An undecided match (':'/'[' not arrived yet) rewinds s_scanned to
+        // the match start: the next call re-examines it with the new bytes.
+        // Without the rewind the pattern start falls out of the overlap
+        // window and the array is never found (fuzz seed 400: empty [] lost).
+        size_t from = (s_scanned >= 7) ? (s_scanned - 7) : 0;
+        size_t cand = blen; // start of undecided match, blen = none
+        for (size_t i = from; i + 8 <= blen; i++) {
+            if (memcmp(buf + i, "\"result\"", 8) != 0) continue;
+            size_t j = i + 8;
+            while (j < blen && (buf[j] == ' ' || buf[j] == '\t')) j++;
+            if (j >= blen) { cand = i; break; }
+            if (buf[j] != ':') continue;
+            j++;
+            while (j < blen && (buf[j] == ' ' || buf[j] == '\t')) j++;
+            if (j >= blen) { cand = i; break; } // split envelope: wait
+            if (buf[j] != '[') continue;
+            s_ssPhase = StreamPhase::SS_IN_ARRAY;
+            s_arrDepth = 1;
+            s_inStr = false;
+            s_esc = false;
+            s_elStart = -1;
+            s_elDepth = 0;
+            s_scanned = j + 1;
+            consumed = j + 1;
+            found = true;
+            break;
+        }
+        if (!found) { s_scanned = cand; return; }
+    }
+    size_t i = s_scanned;
+    bool finished = false; // array-close fired finishRegistryStream (state reset)
+    for (; i < blen; i++) {
+        char c = buf[i];
+        if (s_inStr) {
+            if (s_esc) s_esc = false;
+            else if (c == '\\') s_esc = true;
+            else if (c == '"') s_inStr = false;
+            continue;
+        }
+        if (c == '"') { s_inStr = true; continue; }
+        if (c == '[') { s_arrDepth++; continue; }
+        if (c == ']') {
+            s_arrDepth--;
+            if (s_arrDepth == 0) {
+                finishRegistryStream(); // logs + chains states, deactivates
+                finished = true;        // tail/state already reset, skip below
+                break;
+            }
+            continue;
+        }
+        if (c == '{') {
+            if (s_arrDepth == 1 && s_elDepth == 0) s_elStart = (int)i;
+            s_elDepth++;
+            continue;
+        }
+        if (c == '}') {
+            if (s_elDepth > 0) s_elDepth--;
+            if (s_elDepth == 0 && s_arrDepth == 1 && s_elStart >= 0) {
+                processRegistryElement(buf + s_elStart, (int)(i - (size_t)s_elStart + 1));
+                s_elStart = -1;
+                consumed = i + 1;
+            }
+            continue;
+        }
+    }
+    if (finished) return; // streamReset already ran inside finish
+    s_scanned = blen; // loop ran to end
+    if (consumed > 0) {
+        s_tail.erase(0, consumed);
+        s_scanned -= consumed;
+        if (s_elStart >= 0) {
+            s_elStart -= (int)consumed; // open element always starts past consumed
+            if (s_elStart < 0) { s_elStart = -1; s_elDepth = 0; } // safety net
+        }
+    }
+}
+
 // Auth watchdog. NOTE (1.4.41 crash fix): the main task has only a 4KB
 // stack, so tick() must NEVER call into the client library (send/stop/start
 // nest deeply enough to overflow it - observed as "stack overflow in task
@@ -99,6 +292,7 @@ static void statesTimerStart() {
 // the WS task may be silent and esp_timer context is wrong for stop/start.
 // Policy: resend silent auth up to 4x (12s apart), then reconnect outright.
 static uint32_t s_authSentMs = 0;
+static bool s_authSent = false; // an auth frame already went out this attempt
 static bool s_authWorkerRunning = false;
 
 static void authWorker(void *arg) {
@@ -106,8 +300,10 @@ static void authWorker(void *arg) {
     for (int i = 1; i <= 4; i++) {
         if (!s_client || s_authed) break;
         LogBuffer::logfSerial("HA WS: auth retry #%d", i);
-        if (!s_token.empty())
+        if (!s_token.empty()) {
+            s_authSent = true;
             wsSend("{\"type\":\"auth\",\"access_token\":\"%s\"}", s_token.c_str());
+        }
         for (int k = 0; k < 12; k++) {
             vTaskDelay(pdMS_TO_TICKS(1000));
             if (!s_client || s_authed) break;
@@ -254,7 +450,51 @@ static void parseStateList(const cJSON *states) {
 
 static int s_evCount = 0;
 
+// raw "key":"value" scan (tolerates spaces). Used to route messages without
+// building a cJSON DOM first; any doubt returns safe defaults (parse).
+static bool rawStringVal(const char *data, int len, const char *key, std::string &out) {
+    char pat[32];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    size_t plen = strlen(pat);
+    int n = len < 128 ? len : 128;
+    for (int i = 0; i + (int)plen + 2 < n; i++) {
+        if (memcmp(data + i, pat, plen) != 0) continue;
+        int j = i + (int)plen;
+        while (j < n && (data[j] == ' ' || data[j] == '\t' || data[j] == '\n' || data[j] == '\r')) j++;
+        if (j >= n || data[j] != ':') continue;
+        j++;
+        while (j < n && (data[j] == ' ' || data[j] == '\t' || data[j] == '\n' || data[j] == '\r')) j++;
+        if (j >= n || data[j] != '"') continue;
+        j++;
+        out.clear();
+        while (j < n && data[j] != '"') {
+            if (data[j] == '\\') return false; // escaped: give up, parse fully
+            out += data[j++];
+        }
+        if (j >= n) return false;
+        return true;
+    }
+    return false;
+}
+
+// Pre-parse router: state_changed events for unwatched rows are dropped
+// before the ~1.5KB cJSON DOM is built. Setup phase (watchAll) and every
+// non-event message always parse (fail-open to current behavior).
+static bool shouldParseMessage(const char *data, int len) {
+    if (s_watchAll) return true;
+    std::string t;
+    if (!rawStringVal(data, len, "type", t) || t != "event") return true;
+    std::string eid;
+    if (!rawStringVal(data, len, "entity_id", eid)) return true;
+    PsramString rowId = PsramString("ha:") + haDeviceFor(eid.c_str());
+    for (auto &w : s_watched) {
+        if (w == rowId) return true;
+    }
+    return false;
+}
+
 static void handleMessage(const char *data, int len) {
+    if (!shouldParseMessage(data, len)) return;
     cJSON *msg = cJSON_ParseWithLength(data, len);
     if (!msg) {
         LogBuffer::logfSerial("HA WS: RX %dB unparsable", len);
@@ -277,9 +517,14 @@ static void handleMessage(const char *data, int len) {
     }
 
     if (strcmp(t, "auth_required") == 0) {
-        wsSend("{\"type\":\"auth\",\"access_token\":\"%s\"}", s_token.c_str());
-        // token content NEVER logged; length tells truncation/doubling apart
-        LogBuffer::logfSerial("HA WS: authenticating (token %u chars)", (unsigned)s_token.size());
+        // auth carries no id: a duplicate (watchdog already sent one while
+        // this was in flight) makes HA answer "Message incorrectly formatted"
+        if (!s_authSent) {
+            s_authSent = true;
+            wsSend("{\"type\":\"auth\",\"access_token\":\"%s\"}", s_token.c_str());
+            // token content NEVER logged; length tells truncation/doubling apart
+            LogBuffer::logfSerial("HA WS: authenticating (token %u chars)", (unsigned)s_token.size());
+        }
         s_authSentMs = (uint32_t)(esp_timer_get_time() / 1000);
     } else if (strcmp(t, "auth_ok") == 0) {
         s_authed = true;
@@ -427,6 +672,7 @@ static void wsEventHandler(void *handler_args, esp_event_base_t base,
         case WEBSOCKET_EVENT_CONNECTED:
             s_connected = true;
             s_msgId = 1;
+            s_authSent = false;
             LogBuffer::logfSerial("HA WS connected");
             break;
         case WEBSOCKET_EVENT_DISCONNECTED:
@@ -459,7 +705,60 @@ static void wsEventHandler(void *handler_args, esp_event_base_t base,
             // documents payload_len as the TOTAL length and payload_offset
             // as this event's offset within it.
             if (event->op_code != 0x1 && event->op_code != 0x0) break;
-            if (event->payload_offset == 0) s_frag.clear(); // new frame starts
+            if (event->payload_offset == 0) {
+                // route by envelope id: the registry result streams
+                // element-wise (never accumulated), everything else keeps
+                // the legacy accumulate-then-DOM path below (incl. error
+                // responses, which have no result array to stream)
+                streamReset();
+                int fid = -1;
+                const char *dp = event->data_ptr;
+                int dl = event->data_len;
+                bool head = dl > 0 && dp && s_idRegistry != 0
+                    && rawIntVal(dp, dl, "id", fid) && fid == s_idRegistry;
+                bool arr = false;
+                if (head) {
+                    // the "[" after "result" must sit in the head chunk
+                    // (the ~60B envelope always does); else stay legacy
+                    int n = dl < 256 ? dl : 256;
+                    for (int i = 0; i + 9 < n && !arr; i++) {
+                        if (memcmp(dp + i, "\"result\"", 8) != 0) continue;
+                        int j = i + 8;
+                        while (j < n && (dp[j] == ' ' || dp[j] == '\t')) j++;
+                        if (j < n && dp[j] == ':') {
+                            j++;
+                            while (j < n && (dp[j] == ' ' || dp[j] == '\t')) j++;
+                            arr = (j < n && dp[j] == '[');
+                        }
+                    }
+                }
+                if (head && arr) {
+                    s_streamActive = true;
+                    s_ssPhase = StreamPhase::SS_SEEK_ARRAY;
+                    if (!s_entities) {
+                        void *mem = heap_caps_malloc(sizeof(EntityMap),
+                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                        s_entities = mem ? new (mem) EntityMap() : new EntityMap();
+                    } else {
+                        s_entities->clear();
+                    }
+                }
+            }
+            if (s_streamActive && !s_streamDead) {
+                streamRegistryChunk(event->data_ptr, event->data_len);
+                if (s_streamActive) {
+                    // array-close normally finishes inside the chunk above;
+                    // a truncated tail falls back to the states timer
+                    bool last = event->payload_len > 0
+                        && (event->payload_offset + event->data_len >= event->payload_len);
+                    if (last) {
+                        LogBuffer::logfSerial("HA WS: registry truncated, states will follow");
+                        streamReset();
+                    }
+                }
+                break;
+            }
+            if (event->payload_offset == 0) s_frag.clear(); // new frame starts (legacy)
             if (event->data_len > 0 && event->data_ptr) {
                 if (s_frag.size() + event->data_len > (size_t)(1024 * 1024)) {
                     LogBuffer::logfSerial("HA WS: frame too big, dropping");
@@ -524,6 +823,7 @@ void HAWebSocket::start(const AppConfig &config) {
     ws_cfg.uri = url.c_str();
     ws_cfg.task_stack = 8192;
     ws_cfg.reconnect_timeout_ms = 10000;
+    ws_cfg.network_timeout_ms = 10000;
     s_client = esp_websocket_client_init(&ws_cfg);
     esp_websocket_register_events(s_client, WEBSOCKET_EVENT_ANY,
                                   wsEventHandler, nullptr);
@@ -543,6 +843,8 @@ void HAWebSocket::stop() {
     s_registryDone = false;
     s_statesPending = false;
     s_authed = false;
+    s_authSent = false;
+    s_authSentMs = 0;
     s_msgId = 1;
     s_idRegistry = 0;
     s_idStates = 0;
@@ -552,6 +854,8 @@ void HAWebSocket::stop() {
     s_token.shrink_to_fit();
     s_frag.clear();
     s_frag.shrink_to_fit();
+    streamReset();
+    s_tail.shrink_to_fit();
     if (s_entities) {
         s_entities->~EntityMap();
         heap_caps_free(s_entities);

@@ -68,6 +68,19 @@ struct SensorReading {
     bool hasRssi = false;
     int rssiDbm = 0;
     uint32_t lastUpdateMillis = 0; // millis() timestamp
+    // bumped only when a stored value actually changes (upsert compares);
+    // lets readers skip unchanged entries without string work
+    uint32_t generation = 0;
+    // last accepted RSSI write (throttle: min interval + min delta)
+    uint32_t lastRssiMs = 0;
+};
+
+// One-lock snapshot: reading + resolved display name. Replaces the
+// get()+getDisplayName() pair (two locks + two string builds per cell).
+struct SensorSnapshot {
+    bool found = false;
+    SensorReading reading;
+    std::string name;
 };
 
 // Sensor registry shared by all data sources (HA / Shelly / BLE).
@@ -91,6 +104,8 @@ public:
     // RSSI refresh (e.g. every BLE advert); updates existing entries only.
     static void setRssi(const PsramString &id, int dbm);
     static bool get(const PsramString &id, SensorReading &out);
+    static uint32_t getGeneration(const PsramString &id);
+    static bool getSnapshot(const PsramString &id, SensorSnapshot &out);
     static void getAllCells(std::vector<std::string> &ids);
 
     // display name helpers (empty = auto name).

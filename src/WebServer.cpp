@@ -544,8 +544,24 @@ static esp_err_t handleApiSave(httpd_req_t *req) {
     }
 
     // apply immediately where safe (no risk of restart)
-    if (srcChanged) DataSource::apply(cfg);
-    if (!Dashboard::applyConfig(cfg)) {
+    // a genuine source-type switch reboots instead: the BLE stack has no
+    // teardown path, a live switch would OOM before the reboot (same shape
+    // as the reconnect-reboot above: reply first, then reset)
+    bool needReboot = false;
+    if (srcChanged) needReboot = DataSource::apply(cfg);
+    if (needReboot) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":true,\"reboot\":true}");
+        vTaskDelay(pdMS_TO_TICKS(700));
+        esp_restart();
+    }
+    // skip the full rebuild when nothing render-relevant changed (repeated
+    // saves with identical grid/cells/names); the live snapshot above is
+    // pre-update, so the comparison is against the running state
+    bool gridSame = cfg.grid_rows == live.grid_rows
+        && cfg.grid_cols == live.grid_cols && cfg.cells == live.cells
+        && cfg.name_override_ids == live.name_override_ids;
+    if (!gridSame && !Dashboard::applyConfig(cfg)) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"display busy\"}");
@@ -628,6 +644,16 @@ static esp_err_t handleWifiScan(httpd_req_t *req) {
 
 static esp_err_t handleListSensors(httpd_req_t *req) {
     if (!checkAuth(req)) { resp401(req); return ESP_OK; }
+    // ?all=1: skip the temperature-only filter. The /dashboard mirror needs
+    // every row the RGB display renders (humidity-only devices included);
+    // the assignment candidate lists keep the filtered default.
+    bool all = false;
+    if (httpd_req_get_url_query_len(req) > 0) {
+        char q[32], v[8];
+        if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK
+            && httpd_query_key_value(q, "all", v, sizeof(v)) == ESP_OK)
+            all = (v[0] == '1');
+    }
     std::vector<std::string> ids;
     SensorRegistry::getAllCells(ids);
     cJSON *j = cJSON_CreateObject();
@@ -637,7 +663,7 @@ static esp_err_t handleListSensors(httpd_req_t *req) {
         if (!SensorRegistry::get(id, r)) continue;
         // temperature-only: a device without temperature data (battery-
         // or signal-only) has no place on the candidate lists
-        if (!r.hasTemperature) continue;
+        if (!all && !r.hasTemperature) continue;
         cJSON *e = cJSON_CreateObject();
         cJSON_AddStringToObject(e, "id", id.c_str());
         char buf[32];
@@ -1089,7 +1115,7 @@ static esp_err_t handleDashboardPage(httpd_req_t *req) {
         "const ch=Math.floor((VRES-TOPBAR-MARGIN-(rows-1)*GAP)/rows);"
          "const F=fonts(ch,cw);"
          "let j={sensors:[]};"
-         "try{j=await getj('/api/sensors');}catch(e){say('sensors fetch failed, showing config: '+e);}"
+         "try{j=await getj('/api/sensors?all=1');}catch(e){say('sensors fetch failed, showing config: '+e);}"
          "const byId={};(j.sensors||[]).forEach(function(x){byId[x.id]=x;});"
         "const cells=cfg.cells||[];"
          "let anyPop=false;cells.forEach(function(cc){if(cid(cc))anyPop=true;});"
@@ -1284,6 +1310,13 @@ void WebServer::stop() {
 void WebServer::onConfigChanged() {
     AppConfig cfg;
     ConfigManager::load(cfg);
-    DataSource::apply(cfg);
+    if (DataSource::apply(cfg)) {
+        // source type changed on disk while running (same OOM trap as the
+        // save path): a clean reboot beats a half-torn-down radio stack
+        LogBuffer::logf("Source switched externally, rebooting");
+        vTaskDelay(pdMS_TO_TICKS(700));
+        esp_restart();
+        return;
+    }
     Dashboard::applyConfig(cfg);
 }

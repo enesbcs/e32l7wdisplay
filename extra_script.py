@@ -1,4 +1,4 @@
-import shutil, os, sys
+import shutil, os, sys, re
 
 Import("env")
 
@@ -136,6 +136,38 @@ if ENV_NAME == "esp32-s3":
         raise
     except Exception as e:
         print(f"WebUI JS check skipped ({e})")
+
+# --- /dashboard mirror inline-JS sanity check (same gate as WebUI) ---
+# The mirror page lives in src/WebServer.cpp as C string fragments, so the
+# WebUI.cpp check never saw it - a stray "}" once shipped a dead /dashboard
+# (console: "Missing catch or finally after try"). Rejoin the served page
+# from the handler's fragments and balance-check its <script> blocks.
+def _c_str_contents(src):
+    return "\n".join(m.group(1) for m in re.finditer(r'"((?:[^"\\]|\\.)*)"', src))
+
+if ENV_NAME == "esp32-s3":
+    try:
+        with open(os.path.join(PROJECT_DIR, "src", "WebServer.cpp"), encoding="utf-8") as f:
+            _ws = f.read()
+        _start = _ws.index("static esp_err_t handleDashboardPage")
+        _nxt = re.search(r"^static esp_err_t handle\w+", _ws[_start + 10:], re.M)
+        _region = _ws[_start:_start + 10 + _nxt.start()] if _nxt else _ws[_start:]
+        _page = _c_str_contents(_region)
+        _parts = _page.split("<script>")
+        _scripts = [p.rsplit("</script>", 1)[0] for p in _parts[1:]] if len(_parts) > 1 else []
+        if not _scripts:
+            print("Dashboard JS check skipped (no <script> found)")
+        else:
+            for _i, _js2 in enumerate(_scripts):
+                _ok2, _msg2 = _js_balance_ok(_js2)
+                if not _ok2:
+                    print(f"Dashboard JS syntax check FAILED (block {_i}): {_msg2}")
+                    sys.exit(1)
+            print("Dashboard JS syntax check passed")
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"Dashboard JS check skipped ({e})")
 
 # --- auto-drop a fresh OTA image into dist/ after every app build ---
 if ENV_NAME == "esp32-s3":
