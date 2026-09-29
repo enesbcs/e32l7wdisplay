@@ -165,8 +165,12 @@ void SensorRegistry::setManufacturer(const PsramString &id, const PsramString &m
     if (!takeSensor()) return;
     auto it = s_sensors->find(id);
     if (it != s_sensors->end()) {
-        it->second.manufacturer = mfg;
-        it->second.reading.generation++;
+        // conditional bump: bleUpsert() calls this on EVERY advert, an
+        // unconditional ++ would defeat the generation skip-optimization
+        if (it->second.manufacturer != mfg) {
+            it->second.manufacturer = mfg;
+            it->second.reading.generation++;
+        }
     }
     xSemaphoreGive(s_mutex);
 }
@@ -210,8 +214,13 @@ void SensorRegistry::setAutoName(const PsramString &id, const PsramString &name,
     if (!takeSensor()) return;
     auto &entry = (*s_sensors)[id];
     if (!onlyIfEmpty || entry.autoName.empty()) {
-        entry.autoName = name;
-        entry.reading.generation++;
+        // conditional bump: temperature events call this unconditionally
+        // (onlyIfEmpty=false so temp wins over other members); same-value
+        // repeats must not defeat the generation skip-optimization
+        if (entry.autoName != name) {
+            entry.autoName = name;
+            entry.reading.generation++;
+        }
     }
     xSemaphoreGive(s_mutex);
 }

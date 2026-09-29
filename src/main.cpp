@@ -337,7 +337,6 @@ extern "C" void app_main() {
 
     // --- heartbeat loop ---
     uint32_t lastRefresh = 0;
-    uint32_t lastWifiIconUpdate = 0;
     // Heap gauge: logged to the same LogBuffer every 5s so the serial monitor
     // shows heap_free:NNN -> separates "low heap / leak" from the noise-level
     // "wifi:" driver warning we saw once a second (cosmetic, not fatal).
@@ -391,12 +390,6 @@ extern "C" void app_main() {
                     Integration::apply(s_appConfig);
                 }
             }
-        }
-
-        // update wifi status icon every 30s
-        if (now - lastWifiIconUpdate >= 30000) {
-            lastWifiIconUpdate = now;
-            // could animate if needed; state is tracked internally
         }
     }
 }

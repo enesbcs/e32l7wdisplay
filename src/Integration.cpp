@@ -71,8 +71,8 @@ static cJSON *devObj() {
     cJSON *d = cJSON_CreateObject();
     cJSON *ids = cJSON_AddArrayToObject(d, "ids");
     cJSON_AddItemToArray(ids, cJSON_CreateString(id.c_str()));
-    cJSON_AddStringToObject(d, "mf", "L7");
-    cJSON_AddStringToObject(d, "mdl", "e32l7wdisplay");
+    cJSON_AddStringToObject(d, "mf", "Bitekmindenhol");
+    cJSON_AddStringToObject(d, "mdl", "ESP32 LCD7 Temp Display");
     cJSON_AddStringToObject(d, "name", prefix().c_str());
     cJSON_AddStringToObject(d, "sw", APP_FW_VERSION);
     return d;

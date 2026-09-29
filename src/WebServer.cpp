@@ -874,26 +874,47 @@ static esp_err_t handleUpgradePage(httpd_req_t *req) {
          "var fctTries=0;"
          "function upl(t){var e=eb('f');"
          "if(!e.files||!e.files.length){alert('No file selected');return false;}"
+         "t.disabled=true;"
          "var sl=e.files[0].slice(0,1);var rd=new FileReader();"
          "rd.onload=function(){var bb=new Uint8Array(rd.result);"
          "if(bb.length==1&&bb[0]==0xE9){fctTries=0;fct(t);}"
          "else{t.form.action='/u2?fsz='+e.files[0].size;t.form.submit();}};"
          "rd.readAsArrayBuffer(sl);return false;}"
-         "function su(t){eb('f3').style.display='none';eb('f2').style.display='block';"
-         "upRetry(t.form,0);}"
+         "function su(t){eb('f3').style.display='none';"
+         "fetch('/u4?u4=fct&api=',{cache:'no-store'}).then(function(r){return r.text();}).then(function(s){"
+         "if(s.trim()!=='true'){fctTries=0;fct(t);return;}"
+         "fetch('/api/status',{cache:'no-store'}).then(function(r){return r.text();}).then(function(ss){"
+         "var appAlive=false;try{var j=JSON.parse(ss);if(j&&j.wifi_mode)appAlive=true;}catch(e2){}"
+         "if(appAlive){eb('f3').style.display='block';eb('f3').textContent='app still alive, waiting for safeboot...';fctTries=0;fct(t);}"
+         "else{eb('f2').style.display='block';upPrime(t);}}).catch(function(){"
+         "eb('f2').style.display='block';upPrime(t);});}).catch(function(){fctTries=0;fct(t);});}"
+         "function upPrime(t){ // Tasmota needs GET /up before POST /u2 (one-shot arm); harmless elsewhere"
+         "fetch('/up',{cache:'no-store'}).then(function(){upRetry(t.form,0);}).catch(function(){upRetry(t.form,0);});}"
+         "var UP_BACKOFF=[3000,5000,10000,20000];"
          "function upRetry(form,tries){"
          "var url='/u2?fsz='+eb('f').files[0].size;"
-         "fetch(url,{method:'POST',body:new FormData(form)}).then(function(r){"
-         "return r.text().then(function(s){return {st:r.status,body:s};});}).then(function(o){"
-         "if(o.st===200&&o.body.indexOf('Upload successful')>=0){"
+         "var mb=function(b){return (b/1048576).toFixed(1);};"
+         "var x=new XMLHttpRequest();"
+         "var settled=false;"
+         "function upFail(body){"
+         "if(settled)return;settled=true;"
+         "if(tries<UP_BACKOFF.length){eb('f2').textContent='Upload interrupted, retrying ('+(tries+1)+'/'+(UP_BACKOFF.length+1)+')...';"
+         "setTimeout(function(){upRetry(form,tries+1);},UP_BACKOFF[tries]);}"
+         "else if(body!==null){document.open();document.write(body);document.close();}"
+         "else{eb('f2').textContent='Upload failed - device may still be reachable, retry manually.';var rb=form.querySelector('button');if(rb)rb.disabled=false;}}"
+         "x.upload.onprogress=function(ev){"
+         "if(ev.lengthComputable){eb('f2').textContent='uploading '+mb(ev.loaded)+'/'+mb(ev.total)+' MB ('+Math.floor(100*ev.loaded/ev.total)+'%)...';}"
+         "else{eb('f2').textContent='uploading '+mb(ev.loaded)+' MB...';}};"
+         "x.onreadystatechange=function(){"
+         "if(x.readyState!==4||settled)return;"
+         "if(x.status===200&&/successful/i.test(x.responseText)){"
+         "settled=true;"
          "eb('f2').textContent='Upload done, rebooting into new firmware...';"
-         "setTimeout(function(){pollApp(0);},8000);}"
-         "else if(tries<3){eb('f2').textContent='Upload interrupted, retrying...';"
-         "setTimeout(function(){upRetry(form,tries+1);},3000);}"
-         "else{document.open();document.write(o.body);document.close();}}).catch(function(){"
-         "if(tries<3){eb('f2').textContent='Upload interrupted, retrying...';"
-         "setTimeout(function(){upRetry(form,tries+1);},3000);}"
-         "else{eb('f2').textContent='Upload failed - device may still be reachable, retry manually.';}});}"
+         "setTimeout(function(){pollApp(0);},8000);return;}"
+         "upFail(x.status===0?null:x.responseText);};"
+         "x.onerror=function(){upFail(null);};"
+         "x.open('POST',url,true);"
+         "x.send(new FormData(form));}"
          "function pollApp(n){fetch('/api/status',{cache:'no-store'}).then(function(r){return r.text();}).then(function(s){"
          "var ok=false;try{var j=JSON.parse(s);if(j&&j.wifi_mode)ok=true;}catch(e){}"
          "if(ok){location.href='/';}"
@@ -903,14 +924,16 @@ static esp_err_t handleUpgradePage(httpd_req_t *req) {
          "else{eb('f2').textContent='Device did not come back - it may have fallen back to safeboot. Open /up there.';}});}"
          "function fct(t){var x=new XMLHttpRequest();"
          "x.open('GET','/u4?u4=fct&api=',true);"
+         "x.setRequestHeader('Cache-Control','no-cache');"
          "x.onreadystatechange=function(){"
          "if(x.readyState==4&&x.status==200){var s=x.responseText;"
-         "if(s==='false'){eb('f3').style.display='block';fctTries++;"
+         "if(s.trim()==='false'){eb('f3').style.display='block';eb('f3').textContent='Switching to safeboot partition... waiting ('+fctTries+') - do not reload';fctTries++;"
          "if(fctTries<60){setTimeout(function(){fct(t);},5000);}"
-         "else{eb('f3').textContent='Safeboot is not answering. Join the L7-RECOVERY AP (172.218.28.1) or check STA, then open /up manually.';}}"
-         "if(s==='true'){setTimeout(function(){su(t);},1000);}}"
+         "else{eb('f3').textContent='Safeboot is not answering. Join the L7-RECOVERY AP (172.218.28.1) or check STA, then open /up manually.';t.disabled=false;}}"
+         "if(s.trim()==='true'){setTimeout(function(){su(t);},1000);}}"
          "else if(x.readyState==4&&x.status===0){fctTries++;"
-         "if(fctTries<120){setTimeout(function(){fct(t);},2000);}}};"
+         "if(fctTries<120){setTimeout(function(){fct(t);},2000);}"
+         "else{eb('f3').style.display='block';eb('f3').textContent='Device unreachable - check STA or join the L7-RECOVERY AP, then open /up manually.';t.disabled=false;}}};"
          "x.send();}"
          "</script>";
     sendOtaPage(req, h);
@@ -965,6 +988,20 @@ static esp_err_t handleSwitchBoot(httpd_req_t *req) {
                              "<p><a class='btn alt' href='/'>Back</a></p>");
             return ESP_OK;
         }
+        // Repeat-switch guard: /u4 is polled every few seconds during handoff,
+        // and every hit used to erase otadata + reboot again - a slow shutdown
+        // (or a second tab) reset safeboot's WiFi progress forever. Answer
+        // "false" (keeps the client polling) but reboot at most once per 60s.
+        static uint32_t s_lastFctMs = 0;
+        uint32_t nowMs = (uint32_t)(esp_timer_get_time() / 1000);
+        if (s_lastFctMs != 0 && nowMs - s_lastFctMs < 60000) {
+            ESP_LOGI("WebServer", "[u4] switch already in progress, ignoring repeat");
+            if (api) { httpd_resp_set_type(req, "text/plain"); httpd_resp_sendstr(req, "false"); return ESP_OK; }
+            sendOtaPage(req, "<h2>Partition switch</h2><div class='msg ok'>Switch already "
+                             "in progress, waiting for safeboot...</div>");
+            return ESP_OK;
+        }
+        s_lastFctMs = nowMs;
         ESP_LOGI("WebServer", "[u4] switching to safeboot (erasing otadata)");
         prepRestartToSafeboot();
         if (api) {

@@ -479,10 +479,15 @@ async function loadLog(){
   const r=await api('/api/log');
   document.getElementById('logbox').textContent=await r.text();
 }
-async function doFwUpload(t){
+function doFwUpload(t){
+  // NOTE: must stay a sync function - onsubmit="return ..." only cancels the
+  // native form submit on an exact false return; an async wrapper would hand
+  // back a (truthy) Promise and the browser would POST-navigate to /u2?fsz=
+  // with the pristine empty action, killing this page mid-handoff.
   const e=document.getElementById('fw_file');
   const msg=document.getElementById('fwmsg');
   if(!e.files||!e.files.length){msg.textContent='select a .bin first';return false;}
+  t.disabled=true;
   const f=e.files[0];
   const sl=f.slice(0,1);
   const rd=new FileReader();
@@ -495,45 +500,76 @@ async function doFwUpload(t){
   return false;
 }
 let fctTries=0;
+function fwBtn(){const b=document.querySelector('#fwform button');if(b)b.disabled=false;}
 async function fct(t){
   const e=document.getElementById('fw_file');
   const msg=document.getElementById('fwmsg');
-  msg.textContent='switching to safeboot partition...';
+  msg.textContent='switching to safeboot partition... do not reload, waiting for it to come back';
   const x=new XMLHttpRequest();
   x.open('GET','/u4?u4=fct&api=',true);
+  x.setRequestHeader('Cache-Control','no-cache');
   x.onreadystatechange=function(){
     if(x.readyState===4&&x.status===200){
       const s=x.responseText;
-      if(s==='false'){msg.textContent='switching to safeboot partition...';fctTries++;
+      if(s.trim()==='false'){msg.textContent='switching to safeboot partition... waiting ('+fctTries+')';fctTries++;
         if(fctTries<60){setTimeout(function(){fct(t);},5000);}
-        else{msg.textContent='Safeboot is not answering. Join the L7-RECOVERY AP (172.218.28.1) or check STA, then open /up manually.';}}
-      if(s==='true'){setTimeout(function(){su(t);},1000);}
+        else{msg.textContent='Safeboot is not answering. Join the L7-RECOVERY AP (172.218.28.1) or check STA, then open /up manually.';fwBtn();}}
+      if(s.trim()==='true'){setTimeout(function(){su(t);},1000);}
     }else if(x.readyState===4&&x.status===0){fctTries++;
-      if(fctTries<120){setTimeout(function(){fct(t);},2000);}};
+      if(fctTries<120){setTimeout(function(){fct(t);},2000);}
+      else{msg.textContent='Device unreachable - check STA or join the L7-RECOVERY AP, then open /up manually.';fwBtn();}};
   };
   x.send();
 }
 function su(t){
   const e=document.getElementById('fw_file');
   const msg=document.getElementById('fwmsg');
-  msg.textContent='uploading '+e.files[0].name+' ('+(e.files[0].size/1048576).toFixed(1)+' MB)...';
-  upRetry(t.form,0);
+  msg.textContent='safeboot is up, confirming handoff...';
+  fetch('/u4?u4=fct&api=',{cache:'no-store'}).then(function(r){return r.text();}).then(function(s){
+    if(s.trim()!=='true'){fctTries=0;fct(t);return;}
+    fetch('/api/status',{cache:'no-store'}).then(function(r){return r.text();}).then(function(ss){
+      let appAlive=false;try{const j=JSON.parse(ss);if(j&&j.wifi_mode)appAlive=true;}catch(e2){}
+      if(appAlive){msg.textContent='app still alive, waiting for safeboot...';fctTries=0;fct(t);}
+      else{msg.textContent='uploading '+e.files[0].name+' ('+(e.files[0].size/1048576).toFixed(1)+' MB)...';upPrime(t);}
+    }).catch(function(){msg.textContent='uploading '+e.files[0].name+' ('+(e.files[0].size/1048576).toFixed(1)+' MB)...';upPrime(t);});
+  }).catch(function(){fctTries=0;fct(t);});
 }
+function upPrime(t){
+  // Tasmota arms its /u2 handler via a prior GET /up (one-shot UPL_TASMOTA,
+  // kept in RAM - must run after the reboot, right here). Harmless elsewhere
+  // (plain form GET on our safeboot/APP). Result ignored either way.
+  fetch('/up',{cache:'no-store'}).then(function(){upRetry(t.form,0);}).catch(function(){upRetry(t.form,0);});
+}
+var UP_BACKOFF=[3000,5000,10000,20000];
 function upRetry(form,tries){
   const e=document.getElementById('fw_file');
   const msg=document.getElementById('fwmsg');
   const url='/u2?fsz='+e.files[0].size;
-  fetch(url,{method:'POST',body:new FormData(form)}).then(function(r){
-    return r.text().then(function(s){return {st:r.status,body:s};});}).then(function(o){
-    if(o.st===200&&o.body.indexOf('Upload successful')>=0){
+  const mb=function(b){return (b/1048576).toFixed(1);};
+  const x=new XMLHttpRequest();
+  let settled=false;
+  function upFail(body){
+    if(settled)return;settled=true;
+    if(tries<UP_BACKOFF.length){msg.textContent='Upload interrupted, retrying ('+(tries+1)+'/'+(UP_BACKOFF.length+1)+')...';
+      setTimeout(function(){upRetry(form,tries+1);},UP_BACKOFF[tries]);}
+    else if(body!==null){document.open();document.write(body);document.close();}
+    else{msg.textContent='Upload failed - device may still be reachable, retry manually.';fwBtn();}
+  }
+  x.upload.onprogress=function(ev){
+    if(ev.lengthComputable){msg.textContent='uploading '+mb(ev.loaded)+'/'+mb(ev.total)+' MB ('+Math.floor(100*ev.loaded/ev.total)+'%)...';}
+    else{msg.textContent='uploading '+mb(ev.loaded)+' MB...';}
+  };
+  x.onreadystatechange=function(){
+    if(x.readyState!==4||settled)return;
+    if(x.status===200&&/successful/i.test(x.responseText)){
+      settled=true;
       msg.textContent='Upload done, rebooting into new firmware...';
-      setTimeout(function(){pollAppFw(0);},8000);}
-    else if(tries<3){msg.textContent='Upload interrupted, retrying...';
-      setTimeout(function(){upRetry(form,tries+1);},3000);}
-    else{document.open();document.write(o.body);document.close();}}).catch(function(){
-    if(tries<3){msg.textContent='Upload interrupted, retrying...';
-      setTimeout(function(){upRetry(form,tries+1);},3000);}
-    else{msg.textContent='Upload failed - device may still be reachable, retry manually.';}});
+      setTimeout(function(){pollAppFw(0);},8000);return;}
+    upFail(x.status===0?null:x.responseText);
+  };
+  x.onerror=function(){upFail(null);};
+  x.open('POST',url,true);
+  x.send(new FormData(form));
 }
 function pollAppFw(n){
   const msg=document.getElementById('fwmsg');
